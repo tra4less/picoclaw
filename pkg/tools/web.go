@@ -1060,7 +1060,10 @@ func (opts WebSearchToolOptions) providerByName(name string) (SearchProvider, in
 		if opts.SogouMaxResults > 0 {
 			maxResults = min(opts.SogouMaxResults, 10)
 		}
-		return &SogouSearchProvider{proxy: opts.Proxy, client: client}, maxResults, nil
+		return &SogouSearchProvider{
+			proxy:  opts.Proxy,
+			client: client,
+		}, maxResults, nil
 	case "perplexity":
 		if !opts.PerplexityEnabled || len(opts.PerplexityAPIKeys) == 0 {
 			return nil, 0, nil
@@ -1090,7 +1093,11 @@ func (opts WebSearchToolOptions) providerByName(name string) (SearchProvider, in
 		if opts.BraveMaxResults > 0 {
 			maxResults = min(opts.BraveMaxResults, 10)
 		}
-		return &BraveSearchProvider{keyPool: NewAPIKeyPool(opts.BraveAPIKeys), proxy: opts.Proxy, client: client}, maxResults, nil
+		return &BraveSearchProvider{
+			keyPool: NewAPIKeyPool(opts.BraveAPIKeys),
+			proxy:   opts.Proxy,
+			client:  client,
+		}, maxResults, nil
 	case "searxng":
 		if !opts.SearXNGEnabled || opts.SearXNGBaseURL == "" {
 			return nil, 0, nil
@@ -1099,7 +1106,9 @@ func (opts WebSearchToolOptions) providerByName(name string) (SearchProvider, in
 		if opts.SearXNGMaxResults > 0 {
 			maxResults = min(opts.SearXNGMaxResults, 10)
 		}
-		return &SearXNGSearchProvider{baseURL: opts.SearXNGBaseURL}, maxResults, nil
+		return &SearXNGSearchProvider{
+			baseURL: opts.SearXNGBaseURL,
+		}, maxResults, nil
 	case "tavily":
 		if !opts.TavilyEnabled || len(opts.TavilyAPIKeys) == 0 {
 			return nil, 0, nil
@@ -1130,7 +1139,10 @@ func (opts WebSearchToolOptions) providerByName(name string) (SearchProvider, in
 		if opts.DuckDuckGoMaxResults > 0 {
 			maxResults = min(opts.DuckDuckGoMaxResults, 10)
 		}
-		return &DuckDuckGoSearchProvider{proxy: opts.Proxy, client: client}, maxResults, nil
+		return &DuckDuckGoSearchProvider{
+			proxy:  opts.Proxy,
+			client: client,
+		}, maxResults, nil
 	case "baidu_search":
 		if !opts.BaiduSearchEnabled || opts.BaiduSearchAPIKey == "" {
 			return nil, 0, nil
