@@ -122,6 +122,11 @@ type turnExecution struct {
 	// Iteration tracking
 	iteration int
 
+	// Nag reminder: counts consecutive tool-execution iterations without a todo_write call.
+	// Reset to 0 whenever todo_write is invoked. When this reaches nagTodoRoundsThreshold,
+	// a reminder is injected into the message stream (see pipeline_execute.go).
+	roundsSinceTodoUpdate int
+
 	// Per-iteration state set by Pipeline.PreLLM
 	activeCandidates []providers.FallbackCandidate
 	activeModel      string

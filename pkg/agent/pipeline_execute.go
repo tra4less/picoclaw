@@ -16,6 +16,13 @@ import (
 	"github.com/sipeed/picoclaw/pkg/utils"
 )
 
+// nagTodoRoundsThreshold is the number of consecutive tool-execution iterations without
+// a todo_write call before a nag reminder is injected into the message stream.
+const nagTodoRoundsThreshold = 3
+
+// nagTodoReminderText is the reminder injected when the threshold is reached.
+const nagTodoReminderText = "<reminder>You have pending tasks. Call todo_write to update task statuses.</reminder>"
+
 // ExecuteTools executes the tool loop, handling BeforeTool/ApproveTool/AfterTool hooks,
 // tool execution with async callbacks, media delivery, and steering injection.
 // Returns ToolControl indicating what the coordinator should do next:
@@ -34,6 +41,16 @@ func (p *Pipeline) ExecuteTools(
 	ts.setPhase(TurnPhaseTools)
 	messages := exec.messages
 	handledAttachments := make([]providers.Attachment, 0)
+	todoWriteCalledThisBatch := false
+
+	// Fast path: when no hooks are installed and the LLM requested multiple
+	// tool calls, execute them concurrently to reduce wall-clock latency.
+	if len(normalizedToolCalls) > 1 &&
+		al.hooks == nil &&
+		!ts.hardAbortRequested() &&
+		al.cfg.Agents.Defaults.IsParallelToolExecutionEnabled() {
+		return p.executeToolsBatchParallel(ctx, turnCtx, ts, exec, iteration)
+	}
 
 toolLoop:
 	for i, tc := range normalizedToolCalls {
@@ -409,6 +426,10 @@ toolLoop:
 			})
 		}
 
+		if ts.channel == "pico" && ts.chatID != "" {
+			al.publishPicoToolProgress(turnCtx, ts.chatID, toolName, "running", "Tool execution started.")
+		}
+
 		toolStart := time.Now()
 		execCtx := tools.WithToolInboundContext(
 			turnCtx,
@@ -432,6 +453,10 @@ toolLoop:
 			asyncCallback,
 		)
 		toolDuration := time.Since(toolStart)
+
+		if toolName == "todo_write" {
+			todoWriteCalledThisBatch = true
+		}
 
 		if ts.hardAbortRequested() {
 			exec.abortedByHardAbort = true
@@ -529,10 +554,7 @@ toolLoop:
 			exec.allResponsesHandled = false
 		}
 
-		shouldSendForUser := !toolResult.Silent &&
-			toolResult.ForUser != "" &&
-			(ts.opts.SendResponse || toolResult.ResponseHandled)
-		if shouldSendForUser {
+		if toolResult.ShouldPublishDirectly(ts.opts.SendResponse) {
 			al.bus.PublishOutbound(ctx, outboundMessageForTurn(ts, toolResult.ForUser))
 			logger.DebugCF("agent", "Sent tool result to user",
 				map[string]any{
@@ -638,6 +660,13 @@ toolLoop:
 
 	exec.messages = messages
 
+	// Update nag-reminder counter for this batch.
+	if todoWriteCalledThisBatch {
+		exec.roundsSinceTodoUpdate = 0
+	} else {
+		exec.roundsSinceTodoUpdate++
+	}
+
 	// Continue if pending steering exists (regardless of allResponsesHandled).
 	// This covers the case where tools were partially executed and skipped due to steering,
 	// but one tool had ResponseHandled=false (so allResponsesHandled=false).
@@ -708,5 +737,40 @@ toolLoop:
 	logger.DebugCF("agent", "TTL tick after tool execution", map[string]any{
 		"agent_id": ts.agent.ID, "iteration": iteration,
 	})
+
+	// Nag reminder: if the agent hasn't called todo_write for nagTodoRoundsThreshold
+	// consecutive iterations AND the session still has active todos, inject a reminder
+	// into the message stream so the next LLM call sees it alongside the tool results.
+	if exec.roundsSinceTodoUpdate >= nagTodoRoundsThreshold && hasTodoActiveTasks(ts.agent, ts.sessionKey) {
+		nagMsg := providers.Message{
+			Role:    "user",
+			Content: nagTodoReminderText,
+		}
+		exec.messages = append(exec.messages, nagMsg)
+		exec.roundsSinceTodoUpdate = 0
+		logger.DebugCF("agent", "Injected todo nag reminder",
+			map[string]any{"agent_id": ts.agent.ID, "session": ts.sessionKey})
+	}
+
 	return ToolControlContinue
+}
+
+// hasTodoActiveTasks returns true if any registered tool implements tools.TodoStateReader
+// and reports active (not-started or in-progress) tasks for the given session.
+func hasTodoActiveTasks(agent *AgentInstance, sessionKey string) bool {
+	if agent == nil {
+		return false
+	}
+	for _, name := range agent.Tools.List() {
+		tool, ok := agent.Tools.Get(name)
+		if !ok {
+			continue
+		}
+		if reader, ok := tool.(tools.TodoStateReader); ok {
+			if reader.HasActiveTodos(sessionKey) {
+				return true
+			}
+		}
+	}
+	return false
 }

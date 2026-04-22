@@ -1,7 +1,12 @@
 import { toast } from "sonner"
 
+import {
+  inferStructuredContentFromText,
+  parseStructuredContent,
+} from "@/features/chat/structured"
 import { normalizeUnixTimestamp } from "@/features/chat/state"
 import {
+  getChatState,
   type AssistantMessageKind,
   type ChatAttachment,
   type ContextUsage,
@@ -14,6 +19,10 @@ export interface PicoMessage {
   session_id?: string
   timestamp?: number | string
   payload?: Record<string, unknown>
+}
+
+export interface PicoMessageHandleResult {
+  shouldRefreshHistory: boolean
 }
 
 function parseAssistantMessageKind(
@@ -93,9 +102,9 @@ function parseContextUsage(
 export function handlePicoMessage(
   message: PicoMessage,
   expectedSessionId: string,
-) {
+): PicoMessageHandleResult {
   if (message.session_id && message.session_id !== expectedSessionId) {
-    return
+    return { shouldRefreshHistory: false }
   }
 
   const payload = message.payload || {}
@@ -108,6 +117,10 @@ export function handlePicoMessage(
       const kind = parseAssistantMessageKind(payload)
       const attachments = parseAttachments(payload)
       const contextUsage = parseContextUsage(payload)
+      const wasTyping = getChatState().isTyping
+      const structured =
+        parseStructuredContent(payload.structured) ??
+        (kind === "normal" ? inferStructuredContentFromText(content) : undefined)
       const timestamp =
         message.timestamp !== undefined &&
         Number.isFinite(Number(message.timestamp))
@@ -123,21 +136,35 @@ export function handlePicoMessage(
             content,
             kind,
             attachments,
+            structured,
             timestamp,
           },
         ],
         isTyping: false,
         ...(contextUsage ? { contextUsage } : {}),
       }))
-      break
+
+      return {
+        shouldRefreshHistory:
+          kind === "normal" &&
+          !structured &&
+          content.trim().length > 0 &&
+          wasTyping,
+      }
     }
 
     case "message.update": {
-      const content = (payload.content as string) || ""
+      const hasContent = typeof payload.content === "string"
+      const content = hasContent ? ((payload.content as string) || "") : ""
       const messageId = payload.message_id as string
       const hasKind = hasAssistantKindPayload(payload)
       const kind = parseAssistantMessageKind(payload)
       const attachments = parseAttachments(payload)
+      const structured =
+        parseStructuredContent(payload.structured) ??
+        (hasContent && kind === "normal"
+          ? inferStructuredContentFromText(content)
+          : undefined)
       if (!messageId) {
         break
       }
@@ -147,23 +174,24 @@ export function handlePicoMessage(
           msg.id === messageId
             ? {
                 ...msg,
-                content,
+                ...(hasContent ? { content } : {}),
                 ...(hasKind ? { kind } : {}),
                 ...(attachments ? { attachments } : {}),
+                ...(structured ? { structured } : {}),
               }
             : msg,
         ),
       }))
-      break
+      return { shouldRefreshHistory: false }
     }
 
     case "typing.start":
       updateChatStore({ isTyping: true })
-      break
+      return { shouldRefreshHistory: false }
 
     case "typing.stop":
       updateChatStore({ isTyping: false })
-      break
+      return { shouldRefreshHistory: true }
 
     case "error": {
       const requestId =
@@ -181,13 +209,16 @@ export function handlePicoMessage(
           : prev.messages,
         isTyping: false,
       }))
-      break
+      return { shouldRefreshHistory: false }
     }
 
     case "pong":
-      break
+      return { shouldRefreshHistory: false }
 
     default:
       console.log("Unknown pico message type:", message.type)
+      return { shouldRefreshHistory: false }
   }
+
+  return { shouldRefreshHistory: false }
 }

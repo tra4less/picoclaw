@@ -1,4 +1,5 @@
 import { getSessionHistory } from "@/api/sessions"
+import { parseStructuredContent } from "@/features/chat/structured"
 import { normalizeUnixTimestamp } from "@/features/chat/state"
 import type { ChatAttachment, ChatMessage } from "@/store/chat"
 
@@ -45,11 +46,17 @@ export async function loadSessionMessages(
     id: `hist-${index}-${Date.now()}`,
     role: message.role,
     content: message.content,
-    kind: message.role === "assistant" ? "normal" : undefined,
+    kind:
+      message.role === "assistant"
+        ? message.kind === "thought"
+          ? "thought"
+          : "normal"
+        : undefined,
     attachments: toChatAttachments({
       media: message.media,
       attachments: message.attachments,
     }),
+    structured: parseStructuredContent(message.structured),
     timestamp: fallbackTime,
   }))
 }
@@ -75,10 +82,13 @@ function messageSignature(message: ChatMessage): string {
         `${attachment.type}\u0001${attachment.url}\u0001${attachment.filename ?? ""}`,
     )
     .join("\u0002")
+  const structuredSignature = message.structured
+    ? JSON.stringify(message.structured)
+    : ""
 
   return `${message.role}\u0000${message.content}\u0000${normalizeMessageTimestamp(
     message.timestamp,
-  )}\u0000${message.kind ?? ""}\u0000${attachmentSignature}`
+  )}\u0000${message.kind ?? ""}\u0000${attachmentSignature}\u0000${structuredSignature}`
 }
 
 function comparableTimestamp(timestamp: number | string): number {

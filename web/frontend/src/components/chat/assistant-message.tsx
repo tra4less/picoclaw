@@ -1,30 +1,68 @@
-import {
-  IconBrain,
-  IconCheck,
-  IconChevronDown,
-  IconCopy,
-  IconDownload,
-  IconFileText,
-} from "@tabler/icons-react"
-import { useAtom } from "jotai"
+import { IconBrain, IconCheck, IconCopy, IconDownload, IconFileText } from "@tabler/icons-react"
 import { useState } from "react"
 import { useTranslation } from "react-i18next"
-import ReactMarkdown from "react-markdown"
-import rehypeHighlight from "rehype-highlight"
-import rehypeRaw from "rehype-raw"
-import rehypeSanitize from "rehype-sanitize"
-import remarkGfm from "remark-gfm"
 
 import { Button } from "@/components/ui/button"
+import { inferStructuredContentFromText } from "@/features/chat/structured"
 import { formatMessageTime } from "@/hooks/use-pico-chat"
 import { cn } from "@/lib/utils"
-import { type ChatAttachment, showThoughtsAtom } from "@/store/chat"
+import type { ChatAttachment, ChatStructuredContent, ChatStructuredProgress, ChatStructuredValue } from "@/store/chat"
+
+import { MARKDOWN_BODY_CLASS, StructuredContentView, renderMarkdown } from "./structured-content"
+import { InlinePlanPreview } from "./todo-panel"
+import { ToolProgressPanel } from "./tool-progress-panel"
+
+const MESSAGE_CONTENT_CLASS = "min-w-0 flex-1 space-y-2"
 
 interface AssistantMessageProps {
   content: string
   attachments?: ChatAttachment[]
   isThought?: boolean
   timestamp?: string | number
+  structured?: ChatStructuredValue
+  onSelectOption?: (value: string) => void
+}
+
+function isToolProgressStructured(
+  structured: ChatStructuredContent,
+): structured is ChatStructuredProgress {
+  return structured.type === "progress" && structured.kind === "agent/tool-exec"
+}
+
+function splitStructuredParts(structured: ChatStructuredValue | undefined): {
+  toolProgressParts: ChatStructuredProgress[]
+  otherParts: ChatStructuredContent[]
+} {
+  if (!structured) {
+    return { toolProgressParts: [], otherParts: [] }
+  }
+
+  const parts = Array.isArray(structured) ? structured : [structured]
+  const toolProgressParts: ChatStructuredProgress[] = []
+  const otherParts: ChatStructuredContent[] = []
+
+  for (const part of parts) {
+    if (isToolProgressStructured(part)) {
+      toolProgressParts.push(part)
+      continue
+    }
+    otherParts.push(part)
+  }
+
+  return { toolProgressParts, otherParts }
+}
+
+function shouldPreferStructuredPanel(structured: ChatStructuredValue | undefined): boolean {
+  if (!structured) {
+    return false
+  }
+
+  const parts = Array.isArray(structured) ? structured : [structured]
+  return parts.some(
+    (part) =>
+      part.type === "todo" ||
+      (part.type === "progress" && part.kind === "agent/tool-exec"),
+  )
 }
 
 export function AssistantMessage({
@@ -32,19 +70,22 @@ export function AssistantMessage({
   attachments = [],
   isThought = false,
   timestamp = "",
+  structured,
+  onSelectOption,
 }: AssistantMessageProps) {
   const { t } = useTranslation()
   const [isCopied, setIsCopied] = useState(false)
-  const hasText = content.trim().length > 0
-  const imageAttachments = attachments.filter(
-    (attachment) => attachment.type === "image",
-  )
-  const fileAttachments = attachments.filter(
-    (attachment) => attachment.type !== "image",
-  )
-  const [isExpanded, setIsExpanded] = useAtom(showThoughtsAtom)
-  const formattedTimestamp =
-    timestamp !== "" ? formatMessageTime(timestamp) : ""
+  const formattedTimestamp = timestamp !== "" ? formatMessageTime(timestamp) : ""
+  const hasBody = Boolean(content.trim())
+  const shouldCollapseThought = isThought && content.trim().length > 160
+  const inferredStructured =
+    !structured && !isThought ? inferStructuredContentFromText(content) : undefined
+  const effectiveStructured = structured ?? inferredStructured
+  const { toolProgressParts, otherParts } = splitStructuredParts(effectiveStructured)
+  const hasToolProgress = toolProgressParts.length > 0
+  const preferStructuredPanel = shouldPreferStructuredPanel(effectiveStructured)
+  const shouldShowInlinePlanPreview =
+    !effectiveStructured && /规划|计划|阶段|任务分解|项目目标|任务|plan/i.test(content)
 
   const handleCopy = () => {
     navigator.clipboard.writeText(content).then(() => {
@@ -54,72 +95,43 @@ export function AssistantMessage({
   }
 
   return (
-    <div className="group flex w-full flex-col gap-1.5">
-      {!isThought && (
-        <div className="text-muted-foreground/60 flex items-center justify-between gap-2 px-1 text-xs opacity-70">
-          <div className="flex items-center gap-2">
-            <span>PicoClaw</span>
-            {formattedTimestamp && (
-              <>
-                <span className="opacity-50">•</span>
-                <span>{formattedTimestamp}</span>
-              </>
-            )}
-          </div>
-        </div>
-      )}
+    <div className="group flex w-full max-w-[820px] gap-3">
+      <div className="bg-muted text-muted-foreground mt-5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border/70 text-[11px] font-semibold uppercase">
+        AI
+      </div>
 
-      {(hasText || isThought) && (
-        <div
-          className={cn(
-            "relative overflow-hidden rounded-xl border",
-            isThought
-              ? "border-border/30 bg-muted/20 text-muted-foreground dark:border-border/20 dark:bg-muted/10"
-              : "bg-card text-card-foreground border-border/60",
-          )}
-        >
+      <div className={MESSAGE_CONTENT_CLASS}>
+        <div className="text-muted-foreground flex items-center gap-2 text-[11px] uppercase tracking-[0.14em]">
+          <span>PicoClaw</span>
           {isThought && (
-            <div
-              className="text-muted-foreground/60 hover:text-muted-foreground/80 flex cursor-pointer items-center justify-between px-3 py-2 text-[12px] font-medium transition-colors select-none"
-              onClick={() => setIsExpanded(!isExpanded)}
-            >
-              <div className="flex items-center gap-1.5">
-                <IconBrain className="size-3.5" />
-                <span>{t("chat.reasoningLabel")}</span>
-              </div>
-              <IconChevronDown
-                className={cn(
-                  "size-3.5 opacity-0 transition-all duration-200 group-hover:opacity-100",
-                  isExpanded ? "rotate-180" : "",
-                )}
-              />
-            </div>
+            <span className="inline-flex items-center gap-1 rounded-full border border-amber-300/80 bg-amber-100/80 px-2 py-0.5 text-[10px] font-medium tracking-normal normal-case text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/15 dark:text-amber-200">
+              <IconBrain className="size-3" />
+              <span>{t("chat.reasoningLabel")}</span>
+            </span>
           )}
-          {(!isThought || isExpanded) && hasText && (
-            <div
-              className={cn(
-                "prose dark:prose-invert prose-pre:my-2 prose-pre:overflow-x-auto prose-pre:rounded-lg prose-pre:border prose-pre:bg-zinc-100 prose-pre:p-0 prose-pre:text-zinc-900 dark:prose-pre:bg-zinc-950 dark:prose-pre:text-zinc-100 max-w-none [overflow-wrap:anywhere] break-words",
-                isThought
-                  ? "prose-p:my-1.5 px-3 pt-0 pb-3 text-[13px] leading-relaxed opacity-70"
-                  : "prose-p:my-2 p-4 text-[15px] leading-relaxed",
-              )}
-            >
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                rehypePlugins={[rehypeRaw, rehypeSanitize, rehypeHighlight]}
-              >
-                {content}
-              </ReactMarkdown>
-            </div>
-          )}
+          {formattedTimestamp ? <span className="opacity-60">{formattedTimestamp}</span> : null}
+        </div>
 
-          {!isThought && hasText && (
+        {hasToolProgress && (
+          <div className={cn(!hasBody && "pt-1")}>
+            <ToolProgressPanel items={toolProgressParts} />
+          </div>
+        )}
+
+        {hasBody && !isThought && (!preferStructuredPanel || hasToolProgress) && (
+          <div className="relative rounded-lg px-1 py-0.5">
+            {shouldShowInlinePlanPreview && (
+              <div className="mb-3">
+                <InlinePlanPreview content={content} />
+              </div>
+            )}
+            <div className={cn(MARKDOWN_BODY_CLASS, "prose-p:my-2 text-[14px] leading-6 text-foreground")}>
+              {renderMarkdown(content)}
+            </div>
             <Button
               variant="ghost"
               size="icon"
-              className={cn(
-                "bg-background/50 hover:bg-background/80 absolute top-2 right-2 h-7 w-7 opacity-0 transition-opacity group-hover:opacity-100",
-              )}
+              className="absolute top-0 right-0 h-7 w-7 opacity-0 transition-opacity group-hover:opacity-100"
               onClick={handleCopy}
             >
               {isCopied ? (
@@ -128,58 +140,82 @@ export function AssistantMessage({
                 <IconCopy className="text-muted-foreground h-4 w-4" />
               )}
             </Button>
-          )}
-        </div>
-      )}
+          </div>
+        )}
 
-      {imageAttachments.length > 0 && (
-        <div className="mt-1 flex flex-wrap gap-2">
-          {imageAttachments.map((attachment, index) => (
-            <a
-              key={`${attachment.url}-${index}`}
-              href={attachment.url}
-              target="_blank"
-              rel="noreferrer"
-              className="group/img relative overflow-hidden rounded-xl border border-border/50 bg-muted/30 shadow-sm transition-colors hover:border-border/80"
-            >
-              <img
-                src={attachment.url}
-                alt={attachment.filename || "Attached image"}
-                className="max-h-80 max-w-[280px] object-contain transition-transform duration-300 group-hover/img:scale-[1.02]"
-              />
-              <div className="absolute inset-0 bg-black/0 transition-colors group-hover/img:bg-black/10 dark:group-hover/img:bg-black/20" />
-            </a>
-          ))}
-        </div>
-      )}
+        {hasBody && isThought && !shouldCollapseThought && (
+          <div className="rounded-xl border border-amber-200/80 bg-amber-50/60 p-4 text-amber-950 shadow-sm dark:border-amber-500/30 dark:bg-amber-500/8 dark:text-amber-100">
+            <div className={cn(MARKDOWN_BODY_CLASS, "prose-p:my-1.5 text-[13px] leading-relaxed opacity-90")}>
+              {renderMarkdown(content)}
+            </div>
+          </div>
+        )}
 
-      {fileAttachments.length > 0 && (
-        <div className="mt-1 flex flex-wrap gap-3">
-          {fileAttachments.map((attachment, index) => (
-            <a
-              key={`${attachment.url}-${index}`}
-              href={attachment.url}
-              download={attachment.filename}
-              className="group/file flex w-fit min-w-[220px] max-w-sm items-center gap-3.5 rounded-xl border border-border/60 bg-card px-4 py-3 transition-all duration-300 hover:-translate-y-0.5 hover:border-violet-500/30 hover:shadow-sm dark:hover:border-violet-500/40"
-            >
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-violet-400 ring-1 ring-violet-500/10 dark:bg-violet-500/10 dark:text-violet-400 dark:ring-violet-500/30">
-                <IconFileText className="h-5 w-5" />
+        {hasBody && isThought && shouldCollapseThought && (
+          <details className="rounded-xl border border-amber-200/80 bg-amber-50/60 p-4 text-amber-950 shadow-sm dark:border-amber-500/30 dark:bg-amber-500/8 dark:text-amber-100">
+            <summary className="cursor-pointer text-sm font-medium opacity-90">
+              {t("chat.reasoningLabel")}
+            </summary>
+            <div className={cn(MARKDOWN_BODY_CLASS, "mt-3 text-[13px] leading-relaxed opacity-90")}>
+              {renderMarkdown(content)}
+            </div>
+          </details>
+        )}
+
+        {effectiveStructured && (
+          <div className={cn(!hasBody && "pt-1")}>
+            {otherParts.length > 0 ? (
+              <div className="space-y-3">
+                {otherParts.map((part, index) => (
+                  <StructuredContentView
+                    key={`${part.type}-${index}`}
+                    structured={part}
+                    onSelectOption={onSelectOption}
+                  />
+                ))}
               </div>
-              <div className="flex min-w-0 flex-1 flex-col pr-1">
-                <span className="truncate text-[14px] font-medium leading-tight text-foreground/90 transition-colors group-hover/file:text-violet-600 dark:group-hover/file:text-violet-400">
-                  {attachment.filename || "Download file"}
-                </span>
-                <span className="mt-1 text-[12px] font-medium text-muted-foreground/70">
-                  {attachment.filename?.split(".").pop()?.toUpperCase() || "FILE"}
-                </span>
-              </div>
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-muted/60 text-muted-foreground/50 transition-all duration-300 group-hover/file:bg-violet-400 group-hover/file:text-white group-hover/file:shadow-sm dark:bg-muted/20 dark:group-hover/file:bg-violet-400">
-                <IconDownload className="h-4 w-4 transition-transform duration-300 group-hover/file:-translate-y-[1px]" />
-              </div>
-            </a>
-          ))}
-        </div>
-      )}
+            ) : null}
+          </div>
+        )}
+
+        {attachments && attachments.length > 0 && (
+          <div className="flex flex-col gap-3">
+            {attachments
+              .filter((a) => a.type === "image")
+              .map((attachment, index) => (
+                <a
+                  key={`${attachment.url}-${index}`}
+                  href={attachment.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="overflow-hidden rounded-xl border"
+                >
+                  <img
+                    src={attachment.url}
+                    alt={attachment.filename || "Attachment"}
+                    className="max-h-72 max-w-full object-cover"
+                  />
+                </a>
+              ))}
+            {attachments
+              .filter((a) => a.type !== "image")
+              .map((attachment, index) => (
+                <a
+                  key={`${attachment.url}-${index}`}
+                  href={attachment.url}
+                  download={attachment.filename}
+                  className="bg-background/70 hover:bg-background/90 flex items-center justify-between gap-3 rounded-xl border px-3 py-2 transition-colors"
+                >
+                  <span className="flex min-w-0 items-center gap-2">
+                    <IconFileText className="text-muted-foreground size-4 shrink-0" />
+                    <span className="truncate text-sm">{attachment.filename || "Download attachment"}</span>
+                  </span>
+                  <IconDownload className="text-muted-foreground size-4 shrink-0" />
+                </a>
+              ))}
+          </div>
+        )}
+      </div>
     </div>
   )
 }

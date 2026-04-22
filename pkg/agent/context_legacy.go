@@ -29,6 +29,10 @@ func (m *legacyContextManager) Assemble(_ context.Context, req *AssembleRequest)
 	}
 	history := agent.Sessions.GetHistory(req.SessionKey)
 	summary := agent.Sessions.GetSummary(req.SessionKey)
+	// Layer-1 micro-compact: replace stale tool results with lightweight
+	// placeholders before handing history to the LLM. This reduces prompt
+	// tokens without touching persistent storage.
+	history = microCompactHistory(history)
 	return &AssembleResponse{
 		History: history,
 		Summary: summary,
@@ -387,3 +391,84 @@ func (m *legacyContextManager) estimateTokens(messages []providers.Message) int 
 	}
 	return total
 }
+
+// microCompactHistory is Layer-1 context compression: an in-memory, non-persistent
+// transformation that replaces the content of older tool results with a lightweight
+// placeholder. This keeps recent tool outputs intact for the LLM while shedding the
+// token cost of stale results from earlier in the conversation.
+//
+// Tools that read file contents (read_file, view_file, cat) are always preserved
+// because the LLM frequently back-references their content.
+// The last microCompactKeepRecent tool results are always preserved without change.
+func microCompactHistory(history []providers.Message) []providers.Message {
+	const microCompactKeepRecent = 5
+
+	// Build a map from tool_call_id → tool_name by scanning assistant messages.
+	toolCallNames := make(map[string]string, len(history))
+	for _, msg := range history {
+		for _, tc := range msg.ToolCalls {
+			if tc.ID != "" && tc.Name != "" {
+				toolCallNames[tc.ID] = tc.Name
+			}
+		}
+	}
+
+	// Walk backward counting tool results so we can keep the most recent ones.
+	toolResultCount := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		msg := history[i]
+		if msg.Role == "tool" || (msg.Role == "user" && msg.ToolCallID != "") {
+			toolResultCount++
+		}
+	}
+
+	if toolResultCount <= microCompactKeepRecent {
+		// Nothing to compact.
+		return history
+	}
+
+	// Make a shallow copy so we don't mutate the underlying session slice.
+	compacted := make([]providers.Message, len(history))
+	copy(compacted, history)
+
+	seen := 0
+	for i := len(compacted) - 1; i >= 0; i-- {
+		msg := &compacted[i]
+		if msg.Role != "tool" && !(msg.Role == "user" && msg.ToolCallID != "") {
+			continue
+		}
+		seen++
+		if seen <= microCompactKeepRecent {
+			// Keep this result as-is.
+			continue
+		}
+		// Determine tool name for the placeholder.
+		toolName := toolCallNames[msg.ToolCallID]
+		if toolName == "" {
+			toolName = "tool"
+		}
+		// Preserve read_file and similar content-retrieval outputs.
+		if isContentRetentionTool(toolName) {
+			continue
+		}
+		// Replace with a compact placeholder, clearing heavy fields.
+		compacted[i] = providers.Message{
+			Role:       msg.Role,
+			ToolCallID: msg.ToolCallID,
+			Content:    fmt.Sprintf("[Previous: used %s]", toolName),
+		}
+	}
+
+	return compacted
+}
+
+// isContentRetentionTool returns true for tools whose output should never be
+// replaced by a placeholder because the LLM often re-reads it later.
+func isContentRetentionTool(name string) bool {
+	switch name {
+	case "read_file", "view_file", "cat", "file_read", "read", "get_file", "fetch_file":
+		return true
+	}
+	return false
+}
+

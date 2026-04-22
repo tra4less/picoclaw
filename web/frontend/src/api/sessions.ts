@@ -14,6 +14,7 @@ export interface SessionDetail {
   messages: {
     role: "user" | "assistant"
     content: string
+    kind?: "thought"
     media?: string[]
     attachments?: {
       type?: "image" | "audio" | "video" | "file"
@@ -21,6 +22,7 @@ export interface SessionDetail {
       filename?: string
       content_type?: string
     }[]
+    structured?: Record<string, unknown> | Record<string, unknown>[]
   }[]
   summary: string
   created: string

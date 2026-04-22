@@ -275,6 +275,7 @@ type AgentDefaults struct {
 	SplitOnMarker             bool               `json:"split_on_marker"                  env:"PICOCLAW_AGENTS_DEFAULTS_SPLIT_ON_MARKER"` // split messages on <|[SPLIT]|> marker
 	ContextManager            string             `json:"context_manager,omitempty"        env:"PICOCLAW_AGENTS_DEFAULTS_CONTEXT_MANAGER"`
 	ContextManagerConfig      json.RawMessage    `json:"context_manager_config,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_CONTEXT_MANAGER_CONFIG"`
+	ParallelToolExecution     *bool              `json:"parallel_tool_execution,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_PARALLEL_TOOL_EXECUTION"`
 }
 
 const DefaultMaxMediaSize = 20 * 1024 * 1024 // 20 MB
@@ -297,6 +298,15 @@ func (d *AgentDefaults) GetToolFeedbackMaxArgsLength() int {
 // IsToolFeedbackEnabled returns true when tool feedback messages should be sent to the chat.
 func (d *AgentDefaults) IsToolFeedbackEnabled() bool {
 	return d.ToolFeedback.Enabled
+}
+
+// IsParallelToolExecutionEnabled returns true when multiple tool calls in a single LLM
+// response should be executed concurrently. Defaults to true when unset.
+func (d *AgentDefaults) IsParallelToolExecutionEnabled() bool {
+	if d.ParallelToolExecution == nil {
+		return true
+	}
+	return *d.ParallelToolExecution
 }
 
 // GetModelName returns the effective model name for the agent defaults.

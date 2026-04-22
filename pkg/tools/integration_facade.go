@@ -17,6 +17,8 @@ type (
 	FindSkillsTool           = integrationtools.FindSkillsTool
 	InstallSkillTool         = integrationtools.InstallSkillTool
 	MessageTool              = integrationtools.MessageTool
+	TodoWriteTool            = integrationtools.TodoWriteTool
+	TodoItem                 = integrationtools.TodoItem
 	ReactionTool             = integrationtools.ReactionTool
 	SendTTSTool              = integrationtools.SendTTSTool
 	APIKeyPool               = integrationtools.APIKeyPool
@@ -50,6 +52,10 @@ func NewInstallSkillTool(registryMgr *skills.RegistryManager, workspace string) 
 
 func NewMessageTool() *MessageTool {
 	return integrationtools.NewMessageTool()
+}
+
+func NewTodoWriteTool() *TodoWriteTool {
+	return integrationtools.NewTodoWriteTool()
 }
 
 func NewReactionTool() *ReactionTool {
