@@ -56,7 +56,31 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState, pipeline *Pipel
 
 	// Convenience references to exec fields used throughout the turn loop.
 	messages := exec.messages
-	pendingMessages := exec.pendingMessages
+	type pendingMessage struct {
+		message       providers.Message
+		saveToHistory bool
+	}
+	toSteeringPending := func(src []providers.Message) []pendingMessage {
+		if len(src) == 0 {
+			return nil
+		}
+		out := make([]pendingMessage, 0, len(src))
+		for _, msg := range src {
+			out = append(out, pendingMessage{message: msg, saveToHistory: false})
+		}
+		return out
+	}
+	toProviderMessages := func(src []pendingMessage) []providers.Message {
+		if len(src) == 0 {
+			return nil
+		}
+		out := make([]providers.Message, 0, len(src))
+		for _, msg := range src {
+			out = append(out, msg.message)
+		}
+		return out
+	}
+	pendingMessages := toSteeringPending(exec.pendingMessages)
 	maxMediaSize := pipeline.Cfg.Agents.Defaults.GetMaxMediaSize()
 	finalContent := exec.finalContent
 
@@ -79,12 +103,12 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState, pipeline *Pipel
 			// We do NOT call dequeueSteeringMessagesForScope here because
 			// steering was already consumed from al.steering by ExecuteTools.
 			if len(exec.pendingMessages) > 0 {
-				pendingMessages = append(pendingMessages, exec.pendingMessages...)
+				pendingMessages = append(pendingMessages, toSteeringPending(exec.pendingMessages)...)
 				exec.pendingMessages = nil
 			}
 		} else if !ts.opts.SkipInitialSteeringPoll {
 			if steerMsgs := al.dequeueSteeringMessagesForScopeWithFallback(ts.sessionKey); len(steerMsgs) > 0 {
-				pendingMessages = append(pendingMessages, steerMsgs...)
+				pendingMessages = append(pendingMessages, toSteeringPending(steerMsgs)...)
 			}
 		}
 
@@ -112,7 +136,7 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState, pipeline *Pipel
 				if ok && result != nil && result.ForLLM != "" {
 					content := al.cfg.FilterSensitiveData(result.ForLLM)
 					msg := providers.Message{Role: "user", Content: fmt.Sprintf("[SubTurn Result] %s", content)}
-					pendingMessages = append(pendingMessages, msg)
+					pendingMessages = append(pendingMessages, pendingMessage{message: msg, saveToHistory: true})
 				}
 			default:
 				// No results available
@@ -121,22 +145,26 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState, pipeline *Pipel
 
 		// Inject pending steering messages
 		if len(pendingMessages) > 0 {
-			resolvedPending := resolveMediaRefs(pendingMessages, al.mediaStore, maxMediaSize)
+			providerPending := toProviderMessages(pendingMessages)
+			resolvedPending := resolveMediaRefs(providerPending, al.mediaStore, maxMediaSize)
 			totalContentLen := 0
-			for i, pm := range pendingMessages {
+			for i, pending := range pendingMessages {
+				pm := pending.message
 				messages = append(messages, resolvedPending[i])
 				totalContentLen += len(pm.Content)
-				if !ts.opts.NoHistory {
+				persisted := pending.saveToHistory && !ts.opts.NoHistory
+				if persisted {
 					ts.agent.Sessions.AddFullMessage(ts.sessionKey, pm)
 					ts.recordPersistedMessage(pm)
 					ts.ingestMessage(turnCtx, al, pm)
 				}
 				logger.InfoCF("agent", "Injected steering message into context",
 					map[string]any{
-						"agent_id":    ts.agent.ID,
-						"iteration":   iteration,
-						"content_len": len(pm.Content),
-						"media_count": len(pm.Media),
+						"agent_id":         ts.agent.ID,
+						"iteration":        iteration,
+						"content_len":      len(pm.Content),
+						"media_count":      len(pm.Media),
+						"saved_to_history": persisted,
 					})
 			}
 			al.emitEvent(
@@ -169,7 +197,7 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState, pipeline *Pipel
 			return turnResult{}, callErr
 		}
 		messages = exec.messages
-		pendingMessages = exec.pendingMessages
+		pendingMessages = toSteeringPending(exec.pendingMessages)
 		finalContent = exec.finalContent
 
 		switch ctrl {

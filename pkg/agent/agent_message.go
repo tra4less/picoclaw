@@ -10,6 +10,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/constants"
 	"github.com/sipeed/picoclaw/pkg/logger"
+	"github.com/sipeed/picoclaw/pkg/providers"
 	"github.com/sipeed/picoclaw/pkg/routing"
 	"github.com/sipeed/picoclaw/pkg/session"
 	"github.com/sipeed/picoclaw/pkg/utils"
@@ -149,12 +150,8 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 	scopeKey := resolveScopeKey(allocation.SessionKey, msg.SessionKey)
 	sessionKey := scopeKey
 
-	// Reset message-tool state for this round so we don't skip publishing due to a previous round.
-	if tool, ok := agent.Tools.Get("message"); ok {
-		if resetter, ok := tool.(interface{ ResetSentInRound(sessionKey string) }); ok {
-			resetter.ResetSentInRound(sessionKey)
-		}
-	}
+	// Reset message-like tool state for this round so we don't skip publishing due to a previous round.
+	resetSentTrackingTools(agent, sessionKey)
 
 	logger.InfoCF("agent", "Routed message",
 		map[string]any{
@@ -182,7 +179,10 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		DefaultResponse:         defaultResponse,
 		EnableSummary:           true,
 		SendResponse:            false,
-		AllowInterimPicoPublish: true,
+		AllowInterimPicoPublish: false,
+	}
+	if steering := modeSteeringMessages(msg.Context.Raw); len(steering) > 0 {
+		opts.InitialSteeringMessages = append(opts.InitialSteeringMessages, steering...)
 	}
 
 	// context-dependent commands check their own Runtime fields and report
@@ -201,6 +201,17 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 	}
 
 	return al.runAgentLoop(ctx, agent, opts)
+}
+
+// modeSteeringMessages converts chat mode to initial steering messages.
+// These are injected as user messages to guide the agent's behavior.
+// TODO: Consider moving to system prompt suffix to save tokens.
+func modeSteeringMessages(raw map[string]string) []providers.Message {
+	prompt := getModeSteeringPrompt(raw)
+	if prompt == "" {
+		return nil
+	}
+	return []providers.Message{{Role: "user", Content: prompt}}
 }
 
 func (al *AgentLoop) resolveMessageRoute(msg bus.InboundMessage) (routing.ResolvedRoute, *AgentInstance, error) {

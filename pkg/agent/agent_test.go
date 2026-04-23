@@ -104,6 +104,56 @@ func (r *recordingProvider) GetDefaultModel() string {
 	return "mock-model"
 }
 
+func TestProcessMessage_IncludesChatModeSteering(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = tmpDir
+	cfg.Agents.Defaults.ModelName = "test-model"
+	provider := &recordingProvider{}
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), provider)
+
+	_, err := al.processMessage(context.Background(), bus.InboundMessage{
+		Context: bus.InboundContext{
+			Channel:  "pico",
+			ChatID:   "pico:test-session",
+			ChatType: "direct",
+			SenderID: "pico-user",
+			Raw: map[string]string{
+				"mode": "plan",
+			},
+		},
+		Content: "帮我修一下这个功能",
+	})
+	if err != nil {
+		t.Fatalf("processMessage() error = %v", err)
+	}
+	if len(provider.lastMessages) < 3 {
+		t.Fatalf("provider messages len = %d, want at least 3", len(provider.lastMessages))
+	}
+	var foundSteering bool
+	var foundOriginal bool
+	for _, message := range provider.lastMessages {
+		if message.Role == "user" && strings.Contains(message.Content, "Chat mode is PLAN") {
+			foundSteering = true
+			if !strings.Contains(message.Content, "structured todo payload") {
+				t.Fatalf("plan steering = %q, want structured todo guidance", message.Content)
+			}
+			if !strings.Contains(message.Content, "prefer calling the message tool") {
+				t.Fatalf("plan steering = %q, want message tool preference guidance", message.Content)
+			}
+		}
+		if message.Role == "user" && message.Content == "帮我修一下这个功能" {
+			foundOriginal = true
+		}
+	}
+	if !foundSteering {
+		t.Fatalf("provider messages = %#v, want plan steering instruction present", provider.lastMessages)
+	}
+	if !foundOriginal {
+		t.Fatalf("provider messages = %#v, want original user message present", provider.lastMessages)
+	}
+}
+
 type modelRewriteHook struct {
 	model string
 }
@@ -128,7 +178,7 @@ func useTestSideQuestionProvider(al *AgentLoop, provider providers.LLMProvider) 
 	al.providerFactory = func(mc *config.ModelConfig) (providers.LLMProvider, string, error) {
 		model := provider.GetDefaultModel()
 		if mc != nil {
-			if _, modelID := providers.ExtractProtocol(mc.Model); modelID != "" {
+			if _, modelID := providers.ExtractProtocol(mc); modelID != "" {
 				model = modelID
 			}
 		}
@@ -1051,6 +1101,9 @@ func TestProcessMessage_MediaToolHandledSkipsFollowUpLLMAndFinalText(t *testing.
 	if last.Role != "assistant" || last.Content != "Requested output delivered via tool attachment." {
 		t.Fatalf("expected handled assistant summary in history, got %+v", last)
 	}
+	if len(last.Attachments) != 1 {
+		t.Fatalf("expected handled assistant summary attachments in history, got %+v", last.Attachments)
+	}
 }
 
 func TestProcessMessage_HandledToolProcessesQueuedSteeringBeforeReturning(t *testing.T) {
@@ -1634,6 +1687,36 @@ func (m *handledUserProvider) GetDefaultModel() string {
 	return "handled-user-model"
 }
 
+type toolCallPreferredProvider struct {
+	calls int
+}
+
+func (m *toolCallPreferredProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	m.calls++
+	if m.calls == 1 {
+		return &providers.LLMResponse{
+			Content: "Checking the workspace.",
+			ToolCalls: []providers.ToolCall{{
+				ID:        "call_plain_user_result",
+				Type:      "function",
+				Name:      "plain_user_result_tool",
+				Arguments: map[string]any{},
+			}},
+		}, nil
+	}
+	return &providers.LLMResponse{Content: "Final answer from model after tool result."}, nil
+}
+
+func (m *toolCallPreferredProvider) GetDefaultModel() string {
+	return "tool-call-preferred-model"
+}
+
 type messageToolProvider struct {
 	calls int
 }
@@ -1883,6 +1966,89 @@ func (m *handledUserTool) Parameters() map[string]any {
 
 func (m *handledUserTool) Execute(ctx context.Context, args map[string]any) *tools.ToolResult {
 	return tools.UserResult("Handled user output from tool.").WithResponseHandled()
+}
+
+type plainUserResultTool struct{}
+
+func (m *plainUserResultTool) Name() string { return "plain_user_result_tool" }
+func (m *plainUserResultTool) Description() string {
+	return "Returns a raw user-facing summary without explicit direct delivery"
+}
+
+func (m *plainUserResultTool) Parameters() map[string]any {
+	return map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}
+}
+
+func (m *plainUserResultTool) Execute(ctx context.Context, args map[string]any) *tools.ToolResult {
+	return tools.UserResult("Raw tool output that should stay inside the tool-result loop.")
+}
+
+func TestRunAgentLoop_PlainUserResultDoesNotPublishDirectlyWhenSendResponseEnabled(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = tmpDir
+	cfg.Agents.Defaults.ModelName = "test-model"
+	cfg.Agents.Defaults.MaxTokens = 4096
+	cfg.Agents.Defaults.MaxToolIterations = 10
+
+	msgBus := bus.NewMessageBus()
+	provider := &toolCallPreferredProvider{}
+	al := NewAgentLoop(cfg, msgBus, provider)
+	telegramChannel := &fakeMediaChannel{fakeChannel: fakeChannel{id: "rid-telegram"}}
+	al.SetChannelManager(newStartedTestChannelManager(t, msgBus, nil, "telegram", telegramChannel))
+	al.RegisterTool(&plainUserResultTool{})
+
+	defaultAgent := al.registry.GetDefaultAgent()
+	if defaultAgent == nil {
+		t.Fatal("expected default agent")
+	}
+
+	response, err := al.runAgentLoop(context.Background(), defaultAgent, processOptions{
+		Dispatch: DispatchRequest{
+			SessionKey:  "session-plain-user-result",
+			UserMessage: "inspect and answer",
+			SessionScope: &session.SessionScope{
+				Version:    session.ScopeVersionV1,
+				AgentID:    defaultAgent.ID,
+				Channel:    "telegram",
+				Dimensions: []string{"chat"},
+				Values: map[string]string{
+					"chat": "direct:chat1",
+				},
+			},
+			InboundContext: &bus.InboundContext{
+				Channel:  "telegram",
+				ChatID:   "chat1",
+				ChatType: "direct",
+				SenderID: "user1",
+			},
+		},
+		DefaultResponse: defaultResponse,
+		EnableSummary:   false,
+		SendResponse:    true,
+	})
+	if err != nil {
+		t.Fatalf("runAgentLoop() error = %v", err)
+	}
+	if response != "Final answer from model after tool result." {
+		t.Fatalf("response = %q, want final model answer", response)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(telegramChannel.sentMessages) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(telegramChannel.sentMessages) != 1 {
+		t.Fatalf("expected exactly 1 published final answer, got %+v", telegramChannel.sentMessages)
+	}
+	if telegramChannel.sentMessages[0].Content != "Final answer from model after tool result." {
+		t.Fatalf("expected only final model answer to be published, got %+v", telegramChannel.sentMessages[0])
+	}
+	if provider.calls != 2 {
+		t.Fatalf("expected 2 provider calls, got %d", provider.calls)
+	}
 }
 
 type handledMediaWithSteeringProvider struct {
@@ -2266,6 +2432,75 @@ func TestProcessMessage_CommandOutcomes(t *testing.T) {
 	}
 	if provider.calls != 2 {
 		t.Fatalf("LLM should be called for passthrough /new command, calls=%d", provider.calls)
+	}
+}
+
+func TestProcessMessage_MCPCommandsHandledWithoutLLMCall(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	deferred := true
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				ModelName:         "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+		Session: config.SessionConfig{
+			Dimensions: []string{"chat"},
+		},
+		Tools: config.ToolsConfig{
+			MCP: config.MCPConfig{
+				ToolConfig: config.ToolConfig{Enabled: true},
+				Discovery:  config.ToolDiscoveryConfig{Enabled: true},
+				Servers: map[string]config.MCPServerConfig{
+					"github": {
+						Enabled:  true,
+						Deferred: &deferred,
+					},
+				},
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &countingMockProvider{response: "LLM reply"}
+	al := NewAgentLoop(cfg, msgBus, provider)
+	helper := testHelper{al: al}
+
+	baseContext := bus.InboundContext{
+		Channel:  "whatsapp",
+		ChatID:   "chat1",
+		ChatType: "direct",
+		SenderID: "user1",
+	}
+
+	listResp := helper.executeAndGetResponse(t, context.Background(), bus.InboundMessage{
+		Context: baseContext,
+		Content: "/list mcp",
+	})
+	if !strings.Contains(listResp, "- `github`") || !strings.Contains(listResp, "Deferred: yes") {
+		t.Fatalf("unexpected /list mcp reply: %q", listResp)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("LLM should not be called for /list mcp, calls=%d", provider.calls)
+	}
+
+	showResp := helper.executeAndGetResponse(t, context.Background(), bus.InboundMessage{
+		Context: baseContext,
+		Content: "/show mcp github",
+	})
+	if showResp != "MCP server 'github' is configured but not connected" {
+		t.Fatalf("unexpected /show mcp reply: %q", showResp)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("LLM should not be called for /show mcp, calls=%d", provider.calls)
 	}
 }
 
@@ -3554,6 +3789,45 @@ func TestProcessMessage_PicoPublishesReasoningAsThoughtMessage(t *testing.T) {
 	}
 }
 
+func TestPublishPicoToolProgress_PublishesStructuredPayload(t *testing.T) {
+	msgBus := bus.NewMessageBus()
+	al := NewAgentLoop(config.DefaultConfig(), msgBus, &recordingProvider{})
+
+	al.publishPicoToolProgress(context.Background(), "pico:test-session", "search_files", "running", "Tool execution started.")
+
+	select {
+	case outbound := <-msgBus.OutboundChan():
+		if outbound.Channel != "pico" || outbound.ChatID != "pico:test-session" {
+			t.Fatalf("outbound route = %s/%s, want pico/pico:test-session", outbound.Channel, outbound.ChatID)
+		}
+		rawStructured := outbound.Context.Raw[metadataKeyStructuredData]
+		if rawStructured == "" {
+			t.Fatal("expected structured_data metadata on pico progress message")
+		}
+		var structured struct {
+			Type    string `json:"type"`
+			Kind    string `json:"kind"`
+			Title   string `json:"title"`
+			Status  string `json:"status"`
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal([]byte(rawStructured), &structured); err != nil {
+			t.Fatalf("unmarshal structured_data: %v", err)
+		}
+		if structured.Type != "progress" || structured.Kind != "agent/tool-exec" {
+			t.Fatalf("structured = %#v, want progress/agent-tool-exec", structured)
+		}
+		if structured.Title != "search_files" || structured.Status != "running" {
+			t.Fatalf("structured = %#v, want title/status search_files/running", structured)
+		}
+		if structured.Content != "Tool execution started." {
+			t.Fatalf("structured content = %q, want %q", structured.Content, "Tool execution started.")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected pico progress outbound message")
+	}
+}
+
 func TestProcessHeartbeat_DoesNotPublishToolFeedback(t *testing.T) {
 	tmpDir := t.TempDir()
 	heartbeatFile := filepath.Join(tmpDir, "heartbeat-task.txt")
@@ -3719,7 +3993,7 @@ func TestProcessMessage_MessageToolPublishesOutboundWithTurnMetadata(t *testing.
 	}
 }
 
-func TestRun_PicoPublishesAssistantContentDuringToolCallsWithoutFinalDuplicate(t *testing.T) {
+func TestRun_PicoPublishesProgressDuringToolCallsWithoutFinalDuplicate(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cfg := &config.Config{
@@ -3760,22 +4034,42 @@ func TestRun_PicoPublishesAssistantContentDuringToolCallsWithoutFinalDuplicate(t
 		t.Fatalf("PublishInbound() error = %v", err)
 	}
 
-	outputs := make([]string, 0, 2)
+	type outboundSnapshot struct {
+		content    string
+		structured string
+	}
+	outputs := make([]outboundSnapshot, 0, 4)
 	deadline := time.After(2 * time.Second)
-	for len(outputs) < 2 {
+	for {
 		select {
 		case outbound := <-msgBus.OutboundChan():
-			outputs = append(outputs, outbound.Content)
+			outputs = append(outputs, outboundSnapshot{
+				content:    outbound.Content,
+				structured: outbound.Context.Raw["structured_data"],
+			})
+			if outbound.Content == "final model text" {
+				goto assertions
+			}
 		case <-deadline:
 			t.Fatalf("timed out waiting for pico outputs, got %v", outputs)
 		}
 	}
 
-	if outputs[0] != "intermediate model text" {
-		t.Fatalf("first outbound content = %q, want %q", outputs[0], "intermediate model text")
+assertions:
+	if len(outputs) < 2 {
+		t.Fatalf("expected progress and final outputs, got %v", outputs)
 	}
-	if outputs[1] != "final model text" {
-		t.Fatalf("second outbound content = %q, want %q", outputs[1], "final model text")
+	if outputs[0].content != "tool_limit_test_tool: running\nTool execution started." {
+		t.Fatalf("first outbound content = %q, want progress payload content", outputs[0].content)
+	}
+	if outputs[0].structured == "" {
+		t.Fatalf("expected first outbound to include structured progress payload, got %+v", outputs[0])
+	}
+	if strings.Contains(outputs[0].structured, "intermediate model text") {
+		t.Fatalf("unexpected interim assistant text in structured progress payload: %s", outputs[0].structured)
+	}
+	if outputs[len(outputs)-1].content != "final model text" {
+		t.Fatalf("last outbound content = %q, want %q", outputs[len(outputs)-1].content, "final model text")
 	}
 
 	runCancel()
@@ -3788,12 +4082,14 @@ func TestRun_PicoPublishesAssistantContentDuringToolCallsWithoutFinalDuplicate(t
 		t.Fatal("timed out waiting for Run() to exit")
 	}
 
-	select {
-	case outbound := <-msgBus.OutboundChan():
-		if outbound.Content == "final model text" {
-			t.Fatalf("unexpected duplicate final pico output: %+v", outbound)
+	finalCount := 0
+	for _, outbound := range outputs {
+		if outbound.content == "final model text" {
+			finalCount++
 		}
-	case <-time.After(200 * time.Millisecond):
+	}
+	if finalCount != 1 {
+		t.Fatalf("expected exactly one final pico output, got %d from %+v", finalCount, outputs)
 	}
 }
 
@@ -3839,10 +4135,25 @@ func TestRunAgentLoop_PicoSkipsInterimPublishWhenNotAllowed(t *testing.T) {
 		t.Fatalf("runAgentLoop() response = %q, want %q", response, "final model text")
 	}
 
-	select {
-	case outbound := <-msgBus.OutboundChan():
-		t.Fatalf("unexpected outbound message when interim publish disabled: %+v", outbound)
-	case <-time.After(200 * time.Millisecond):
+	outputs := make([]bus.OutboundMessage, 0, 4)
+	collectUntil := time.After(300 * time.Millisecond)
+	for {
+		select {
+		case outbound := <-msgBus.OutboundChan():
+			outputs = append(outputs, outbound)
+		case <-collectUntil:
+			goto verifyNoInterim
+		}
+	}
+
+verifyNoInterim:
+	if len(outputs) == 0 {
+		t.Fatal("expected structured progress outbound even when interim publish is disabled")
+	}
+	for _, outbound := range outputs {
+		if outbound.Content == "intermediate model text" {
+			t.Fatalf("unexpected interim assistant text when disabled: %+v", outbound)
+		}
 	}
 }
 

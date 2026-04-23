@@ -46,9 +46,19 @@ type sessionListItem struct {
 }
 
 type sessionChatMessage struct {
-	Role    string   `json:"role"`
-	Content string   `json:"content"`
-	Media   []string `json:"media,omitempty"`
+	Role        string                  `json:"role"`
+	Content     string                  `json:"content"`
+	Kind        string                  `json:"kind,omitempty"`
+	Media       []string                `json:"media,omitempty"`
+	Structured  any                     `json:"structured,omitempty"`
+	Attachments []sessionChatAttachment `json:"attachments,omitempty"`
+}
+
+type sessionChatAttachment struct {
+	Type        string `json:"type,omitempty"`
+	URL         string `json:"url,omitempty"`
+	Filename    string `json:"filename,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
 }
 
 // legacyPicoSessionPrefix is the legacy key prefix used by older Pico JSON/JSONL
@@ -398,10 +408,12 @@ func (h *Handler) findLegacyPicoSession(dir, sessionID string) (picoLegacySessio
 }
 
 func buildSessionListItem(sessionID string, sess sessionFile, toolFeedbackMaxArgsLength int) sessionListItem {
+	transcript := visibleSessionMessages(sess.Messages, toolFeedbackMaxArgsLength)
+
 	preview := ""
-	for _, msg := range sess.Messages {
+	for _, msg := range transcript {
 		if msg.Role == "user" {
-			preview = sessionMessagePreview(msg)
+			preview = sessionChatMessagePreview(msg)
 		}
 		if preview != "" {
 			break
@@ -414,13 +426,11 @@ func buildSessionListItem(sessionID string, sess sessionFile, toolFeedbackMaxArg
 	}
 	title := preview
 
-	validMessageCount := len(visibleSessionMessages(sess.Messages, toolFeedbackMaxArgsLength))
-
 	return sessionListItem{
 		ID:           sessionID,
 		Title:        title,
 		Preview:      preview,
-		MessageCount: validMessageCount,
+		MessageCount: len(transcript),
 		Created:      sess.Created.Format(time.RFC3339),
 		Updated:      sess.Updated.Format(time.RFC3339),
 	}
@@ -441,16 +451,25 @@ func truncateRunes(s string, maxLen int) string {
 	return string(runes[:maxLen]) + "..."
 }
 
-func sessionMessageVisible(msg providers.Message) bool {
-	return strings.TrimSpace(msg.Content) != "" || len(msg.Media) > 0
+func sessionChatMessageVisible(msg sessionChatMessage) bool {
+	return strings.TrimSpace(msg.Content) != "" || len(msg.Media) > 0 || len(msg.Attachments) > 0
 }
 
-func sessionMessagePreview(msg providers.Message) string {
+func sessionChatMessagePreview(msg sessionChatMessage) string {
 	if content := strings.TrimSpace(msg.Content); content != "" {
 		return content
 	}
+	if len(msg.Attachments) > 0 {
+		if strings.EqualFold(strings.TrimSpace(msg.Attachments[0].Type), "image") {
+			return "[image]"
+		}
+		return "[attachment]"
+	}
 	if len(msg.Media) > 0 {
-		return "[image]"
+		if strings.HasPrefix(strings.TrimSpace(msg.Media[0]), "data:image/") {
+			return "[image]"
+		}
+		return "[attachment]"
 	}
 	return ""
 }
@@ -459,24 +478,30 @@ func visibleSessionMessages(messages []providers.Message, toolFeedbackMaxArgsLen
 	transcript := make([]sessionChatMessage, 0, len(messages))
 
 	for _, msg := range messages {
-		switch msg.Role {
-		case "tool":
-			continue
+		attachments := sessionAttachments(msg)
 
+		switch msg.Role {
 		case "user":
-			if sessionMessageVisible(msg) {
-				transcript = append(transcript, sessionChatMessage{
-					Role:    "user",
-					Content: msg.Content,
-					Media:   append([]string(nil), msg.Media...),
-				})
+			chatMsg := sessionChatMessage{
+				Role:        "user",
+				Content:     msg.Content,
+				Media:       append([]string(nil), msg.Media...),
+				Attachments: attachments,
+			}
+			if sessionChatMessageVisible(chatMsg) {
+				transcript = append(transcript, chatMsg)
 			}
 
 		case "assistant":
-			// Reasoning-only assistant messages are transient display artifacts and
-			// should not be restored from session history.
-			if assistantMessageTransientThought(msg) {
-				continue
+			if strings.TrimSpace(msg.ReasoningContent) != "" {
+				transcript = append(transcript, sessionChatMessage{
+					Role:    "assistant",
+					Content: msg.ReasoningContent,
+					Kind:    "thought",
+				})
+				if assistantMessageTransientThought(msg) {
+					continue
+				}
 			}
 
 			toolSummaryMessages := visibleAssistantToolSummaryMessages(msg.ToolCalls, toolFeedbackMaxArgsLength)
@@ -489,44 +514,139 @@ func visibleSessionMessages(messages []providers.Message, toolFeedbackMaxArgsLen
 				transcript = append(transcript, visibleToolMessages...)
 			}
 
-			// Pico web chat can persist both visible `message` tool output and a
-			// later plain assistant reply in the same turn. Hide only the fixed
-			// internal summary that marks handled tool delivery.
-			if !sessionMessageVisible(msg) || assistantMessageInternalOnly(msg) {
+			// Tool-call assistant content is usually a transient preamble such as
+			// "I'll check that now." Keep the reconstructed tool summaries/cards and
+			// hide the raw assistant content to match the live Copilot-style UI.
+			if len(msg.ToolCalls) > 0 {
 				continue
 			}
 
-			transcript = append(transcript, sessionChatMessage{
-				Role:    "assistant",
-				Content: msg.Content,
-				Media:   append([]string(nil), msg.Media...),
-			})
+			// Pico web chat can persist both visible `message` tool output and a
+			// later plain assistant reply in the same turn. Hide only the fixed
+			// internal summary that marks handled tool delivery.
+			content := msg.Content
+			if assistantMessageInternalOnly(msg) {
+				if len(attachments) == 0 {
+					continue
+				}
+				content = ""
+			}
+
+			chatMsg := sessionChatMessage{
+				Role:        "assistant",
+				Content:     content,
+				Media:       append([]string(nil), msg.Media...),
+				Attachments: attachments,
+			}
+			if !sessionChatMessageVisible(chatMsg) {
+				continue
+			}
+
+			transcript = append(transcript, chatMsg)
 		}
 	}
 
-	return filterSessionChatMessages(transcript)
+	return transcript
 }
 
-func filterSessionChatMessages(messages []sessionChatMessage) []sessionChatMessage {
-	filtered := messages[:0]
-	for _, msg := range messages {
-		if msg.Role != "user" && msg.Role != "assistant" {
+func sessionAttachments(msg providers.Message) []sessionChatAttachment {
+	if len(msg.Attachments) == 0 {
+		return nil
+	}
+
+	attachments := make([]sessionChatAttachment, 0, len(msg.Attachments))
+	for _, attachment := range msg.Attachments {
+		urlValue, ok := sessionAttachmentURL(attachment)
+		if !ok {
 			continue
 		}
-		filtered = append(filtered, msg)
+		attachmentType := strings.TrimSpace(attachment.Type)
+		if attachmentType == "" {
+			attachmentType = sessionAttachmentType(attachment)
+		}
+		attachments = append(attachments, sessionChatAttachment{
+			Type:        attachmentType,
+			URL:         urlValue,
+			Filename:    strings.TrimSpace(attachment.Filename),
+			ContentType: strings.TrimSpace(attachment.ContentType),
+		})
 	}
-	return filtered
+
+	if len(attachments) == 0 {
+		return nil
+	}
+	return attachments
+}
+
+func sessionAttachmentURL(attachment providers.Attachment) (string, bool) {
+	if rawURL := strings.TrimSpace(attachment.URL); rawURL != "" {
+		return rawURL, true
+	}
+
+	ref := strings.TrimSpace(attachment.Ref)
+	if ref == "" {
+		return "", false
+	}
+	if strings.HasPrefix(ref, "media://") {
+		// Persisted session history must only expose durable attachment locations.
+		// media:// refs depend on the live in-memory MediaStore and may stop
+		// resolving after a restart or cleanup, so omit them from reopened history.
+		return "", false
+	}
+	return ref, true
+}
+
+func sessionAttachmentType(attachment providers.Attachment) string {
+	contentType := strings.ToLower(strings.TrimSpace(attachment.ContentType))
+	filename := strings.ToLower(strings.TrimSpace(attachment.Filename))
+	rawRef := strings.ToLower(strings.TrimSpace(attachment.Ref))
+	rawURL := strings.ToLower(strings.TrimSpace(attachment.URL))
+
+	switch {
+	case strings.HasPrefix(contentType, "image/"),
+		strings.HasPrefix(rawRef, "data:image/"),
+		strings.HasPrefix(rawURL, "data:image/"):
+		return "image"
+	case strings.HasPrefix(contentType, "audio/"):
+		return "audio"
+	case strings.HasPrefix(contentType, "video/"):
+		return "video"
+	}
+
+	switch ext := filepath.Ext(filename); ext {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg":
+		return "image"
+	case ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".wma", ".opus":
+		return "audio"
+	case ".mp4", ".avi", ".mov", ".webm", ".mkv":
+		return "video"
+	default:
+		return "file"
+	}
 }
 
 func assistantMessageTransientThought(msg providers.Message) bool {
 	return strings.TrimSpace(msg.Content) == "" &&
 		strings.TrimSpace(msg.ReasoningContent) != "" &&
 		len(msg.ToolCalls) == 0 &&
-		len(msg.Media) == 0
+		len(msg.Media) == 0 &&
+		len(msg.Attachments) == 0
 }
 
 func assistantMessageInternalOnly(msg providers.Message) bool {
 	return strings.TrimSpace(msg.Content) == handledToolResponseSummaryText
+}
+
+// resolveToolArgsJSON returns the JSON-encoded arguments string for a tool call.
+// When argsJSON is empty but tc.Arguments holds a decoded map, it encodes the map
+// to JSON as a fallback, keeping callers free from this boilerplate.
+func resolveToolArgsJSON(argsJSON string, rawArgs map[string]any) string {
+	if strings.TrimSpace(argsJSON) == "" && len(rawArgs) > 0 {
+		if encoded, err := json.Marshal(rawArgs); err == nil {
+			return string(encoded)
+		}
+	}
+	return argsJSON
 }
 
 func visibleAssistantToolSummaryMessages(
@@ -542,31 +662,185 @@ func visibleAssistantToolSummaryMessages(
 
 	messages := make([]sessionChatMessage, 0, len(toolCalls))
 	for _, tc := range toolCalls {
-		name, argsJSON := toolCallNameAndArguments(tc)
+		name := tc.Name
+		argsJSON := ""
+		if tc.Function != nil {
+			if name == "" {
+				name = tc.Function.Name
+			}
+			argsJSON = tc.Function.Arguments
+		}
+
 		if strings.TrimSpace(name) == "" {
 			continue
 		}
-		if name == "web_search" || name == "web_fetch" {
-			continue
-		}
+
+		// For the "message" tool: only add a summary when structured content
+		// (options or a structured payload) is present. Plain-text message tool
+		// output is shown directly via visibleAssistantToolMessages without a
+		// preceding summary card.
 		if name == "message" {
-			if _, ok := parseMessageToolContent(argsJSON); ok {
+			resolvedArgs := resolveToolArgsJSON(argsJSON, tc.Arguments)
+			var args map[string]any
+			if err := json.Unmarshal([]byte(resolvedArgs), &args); err != nil {
 				continue
 			}
+			if visibleStructuredMessageArg(args) == nil {
+				continue
+			}
+			argsPreview := resolvedArgs
+			if argsPreview == "" {
+				argsPreview = "{}"
+			}
+			messages = append(messages, sessionChatMessage{
+				Role:    "assistant",
+				Content: utils.FormatToolFeedbackMessage(name, utils.Truncate(argsPreview, toolFeedbackMaxArgsLength)),
+			})
+			continue
 		}
 
-		argsPreview := strings.TrimSpace(argsJSON)
-		if argsPreview == "" {
-			argsPreview = "{}"
-		}
-
+		content := visibleAssistantToolProgressContent(name, argsJSON, tc.Arguments, toolFeedbackMaxArgsLength)
 		messages = append(messages, sessionChatMessage{
 			Role:    "assistant",
-			Content: utils.FormatToolFeedbackMessage(name, utils.Truncate(argsPreview, toolFeedbackMaxArgsLength)),
+			Content: "",
+			Structured: map[string]any{
+				"type":    "progress",
+				"kind":    "agent/tool-exec",
+				"title":   name,
+				"status":  "completed",
+				"content": content,
+			},
 		})
 	}
 
 	return messages
+}
+
+func visibleAssistantToolProgressContent(
+	toolName string,
+	argsJSON string,
+	rawArgs map[string]any,
+	maxArgsLength int,
+) string {
+	if maxArgsLength <= 0 {
+		maxArgsLength = defaultToolFeedbackMaxArgsLength()
+	}
+
+	args := map[string]any{}
+	if strings.TrimSpace(argsJSON) != "" {
+		_ = json.Unmarshal([]byte(argsJSON), &args)
+	}
+	for key, value := range rawArgs {
+		if _, exists := args[key]; !exists {
+			args[key] = value
+		}
+	}
+
+	if summary := summarizeToolArgs(toolName, args); summary != "" {
+		return summary
+	}
+
+	preview := resolveToolArgsJSON(argsJSON, rawArgs)
+	if preview == "" {
+		return "Tool executed during this turn."
+	}
+
+	return utils.Truncate(preview, maxArgsLength)
+}
+
+func summarizeToolArgs(toolName string, args map[string]any) string {
+	if len(args) == 0 {
+		return ""
+	}
+
+	path := firstNonEmptyString(args, "path", "filePath", "file_path", "dirPath", "dir_path", "resourcePath", "workspaceFolder")
+	query := firstNonEmptyString(args, "query", "command", "goal", "target")
+	url := firstNonEmptyString(args, "url")
+	urls := stringSliceSummary(args["urls"])
+	packages := stringSliceSummary(args["packageList"])
+
+	parts := make([]string, 0, 3)
+	if path != "" {
+		if toolName == "read_file" {
+			if start, ok := numericArg(args, "startLine", "start_line"); ok {
+				if end, ok := numericArg(args, "endLine", "end_line"); ok {
+					parts = append(parts, path+":"+strconv.Itoa(start)+"-"+strconv.Itoa(end))
+				} else {
+					parts = append(parts, path+":"+strconv.Itoa(start))
+				}
+			} else {
+				parts = append(parts, path)
+			}
+		} else {
+			parts = append(parts, path)
+		}
+	}
+	if query != "" && query != path {
+		parts = append(parts, query)
+	}
+	if url != "" {
+		parts = append(parts, url)
+	} else if urls != "" {
+		parts = append(parts, urls)
+	}
+	if packages != "" {
+		parts = append(parts, packages)
+	}
+
+	return strings.Join(parts, " | ")
+}
+
+func firstNonEmptyString(args map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := args[key]; ok {
+			switch typed := value.(type) {
+			case string:
+				if trimmed := strings.TrimSpace(typed); trimmed != "" {
+					return trimmed
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func numericArg(args map[string]any, keys ...string) (int, bool) {
+	for _, key := range keys {
+		value, ok := args[key]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case float64:
+			return int(typed), true
+		case int:
+			return typed, true
+		case int64:
+			return int(typed), true
+		case json.Number:
+			if parsed, err := typed.Int64(); err == nil {
+				return int(parsed), true
+			}
+		}
+	}
+	return 0, false
+}
+
+func stringSliceSummary(value any) string {
+	switch typed := value.(type) {
+	case []string:
+		return strings.Join(typed, ", ")
+	case []any:
+		items := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text, ok := item.(string); ok && strings.TrimSpace(text) != "" {
+				items = append(items, strings.TrimSpace(text))
+			}
+		}
+		return strings.Join(items, ", ")
+	default:
+		return ""
+	}
 }
 
 func visibleAssistantToolMessages(toolCalls []providers.ToolCall) []sessionChatMessage {
@@ -576,51 +850,144 @@ func visibleAssistantToolMessages(toolCalls []providers.ToolCall) []sessionChatM
 
 	messages := make([]sessionChatMessage, 0, len(toolCalls))
 	for _, tc := range toolCalls {
-		name, argsJSON := toolCallNameAndArguments(tc)
-		if name != "message" {
-			continue
+		name := tc.Name
+		argsJSON := ""
+		if tc.Function != nil {
+			if name == "" {
+				name = tc.Function.Name
+			}
+			argsJSON = tc.Function.Arguments
 		}
-		content, ok := parseMessageToolContent(argsJSON)
-		if !ok {
-			continue
+
+		switch name {
+		case "message":
+			var args map[string]any
+			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+				continue
+			}
+			content, _ := args["content"].(string)
+			structured := visibleStructuredMessageArg(args)
+			if strings.TrimSpace(content) == "" && structured == nil {
+				continue
+			}
+			messages = append(messages, sessionChatMessage{
+				Role:       "assistant",
+				Content:    content,
+				Structured: structured,
+			})
 		}
-		messages = append(messages, sessionChatMessage{
-			Role:    "assistant",
-			Content: content,
-		})
 	}
 
 	return messages
 }
 
-func toolCallNameAndArguments(tc providers.ToolCall) (string, string) {
-	name := tc.Name
-	argsJSON := ""
-	if tc.Function != nil {
-		if name == "" {
-			name = tc.Function.Name
+func visibleStructuredMessageArg(args map[string]any) any {
+	if rawStructured, ok := args["structured"]; ok && rawStructured != nil {
+		switch structured := rawStructured.(type) {
+		case map[string]any:
+			msgType, _ := structured["type"].(string)
+			if strings.TrimSpace(msgType) != "" {
+				return structured
+			}
+		case []any:
+			parts := make([]any, 0, len(structured))
+			for _, item := range structured {
+				entry, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				msgType, _ := entry["type"].(string)
+				if strings.TrimSpace(msgType) == "" {
+					continue
+				}
+				parts = append(parts, entry)
+			}
+			if len(parts) > 0 {
+				return parts
+			}
 		}
-		argsJSON = tc.Function.Arguments
 	}
-	if strings.TrimSpace(argsJSON) == "" && len(tc.Arguments) > 0 {
-		if encodedArgs, err := json.Marshal(tc.Arguments); err == nil {
-			argsJSON = string(encodedArgs)
-		}
-	}
-	return name, argsJSON
-}
 
-func parseMessageToolContent(argsJSON string) (string, bool) {
-	var args struct {
-		Content string `json:"content"`
+	var rawOptions []any
+	switch optionsValue := args["options"].(type) {
+	case []any:
+		rawOptions = optionsValue
+	case map[string]any:
+		items, ok := optionsValue["options"].([]any)
+		if !ok || len(items) == 0 {
+			return nil
+		}
+		rawOptions = items
+		result := map[string]any{
+			"type":    "options",
+			"options": []map[string]any{},
+		}
+		for _, key := range []string{"mode", "selectionMode", "selection_mode", "multiple", "multi", "multiSelect", "multi_select", "allowCustom", "allow_custom", "customPlaceholder", "custom_placeholder", "submitLabel", "submit_label"} {
+			if value, exists := optionsValue[key]; exists {
+				result[key] = value
+			}
+		}
+
+		options := make([]map[string]any, 0, len(rawOptions))
+		for _, item := range rawOptions {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			label, _ := entry["label"].(string)
+			value, _ := entry["value"].(string)
+			if strings.TrimSpace(label) == "" || strings.TrimSpace(value) == "" {
+				continue
+			}
+			option := map[string]any{
+				"label": label,
+				"value": value,
+			}
+			if description, _ := entry["description"].(string); strings.TrimSpace(description) != "" {
+				option["description"] = description
+			}
+			options = append(options, option)
+		}
+		if len(options) == 0 {
+			return nil
+		}
+		result["options"] = options
+		return result
+	default:
+		return nil
 	}
-	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return "", false
+	if len(rawOptions) == 0 {
+		return nil
 	}
-	if strings.TrimSpace(args.Content) == "" {
-		return "", false
+
+	options := make([]map[string]any, 0, len(rawOptions))
+	for _, item := range rawOptions {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		label, _ := entry["label"].(string)
+		value, _ := entry["value"].(string)
+		if strings.TrimSpace(label) == "" || strings.TrimSpace(value) == "" {
+			continue
+		}
+		option := map[string]any{
+			"label": label,
+			"value": value,
+		}
+		if description, _ := entry["description"].(string); strings.TrimSpace(description) != "" {
+			option["description"] = description
+		}
+		options = append(options, option)
 	}
-	return args.Content, true
+	if len(options) == 0 {
+		return nil
+	}
+
+	return map[string]any{
+		"type":    "options",
+		"options": options,
+	}
 }
 
 // sessionsDir resolves the path to the gateway's session storage directory.
